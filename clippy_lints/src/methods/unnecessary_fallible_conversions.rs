@@ -27,6 +27,10 @@ enum FunctionKind {
     TryIntoMethod,
     /// `U::try_into(t)`
     TryIntoFunction(Option<SpansKind>),
+    /// `T::from_str(s)`
+    FromStrFunction(Option<SpansKind>),
+    /// `s.parse::<T>()`
+    ParseMethod,
 }
 
 impl FunctionKind {
@@ -36,9 +40,9 @@ impl FunctionKind {
         };
 
         match &self {
-            FunctionKind::TryFromFunction(None) | FunctionKind::TryIntoFunction(None) => {
-                (Applicability::Unspecified, self.default_sugg(primary_span))
-            },
+            FunctionKind::TryFromFunction(None)
+            | FunctionKind::TryIntoFunction(None)
+            | FunctionKind::FromStrFunction(None) => (Applicability::Unspecified, self.default_sugg(primary_span)),
             _ => (
                 Applicability::MachineApplicable,
                 self.machine_applicable_sugg(primary_span, unwrap_span),
@@ -48,9 +52,9 @@ impl FunctionKind {
 
     fn default_sugg(&self, primary_span: Span) -> Vec<(Span, String)> {
         let replacement = match *self {
-            FunctionKind::TryFromFunction(_) => "From::from",
+            FunctionKind::TryFromFunction(_) | FunctionKind::FromStrFunction { .. } => "From::from",
             FunctionKind::TryIntoFunction(_) => "Into::into",
-            FunctionKind::TryIntoMethod => "into",
+            FunctionKind::TryIntoMethod | FunctionKind::ParseMethod => "into",
         };
 
         vec![(primary_span, String::from(replacement))]
@@ -58,8 +62,12 @@ impl FunctionKind {
 
     fn machine_applicable_sugg(&self, primary_span: Span, unwrap_span: Span) -> Vec<(Span, String)> {
         let (trait_name, fn_name) = match self {
-            FunctionKind::TryFromFunction(_) => ("From".to_owned(), "from".to_owned()),
-            FunctionKind::TryIntoFunction(_) | FunctionKind::TryIntoMethod => ("Into".to_owned(), "into".to_owned()),
+            FunctionKind::TryFromFunction(_) | FunctionKind::FromStrFunction { .. } => {
+                ("From".to_owned(), "from".to_owned())
+            },
+            FunctionKind::TryIntoFunction(_) | FunctionKind::TryIntoMethod | FunctionKind::ParseMethod => {
+                ("Into".to_owned(), "into".to_owned())
+            },
         };
 
         let mut sugg = match *self {
@@ -89,13 +97,16 @@ fn check<'tcx>(
         && self_ty != other_ty
         && let Some(self_ty) = self_ty.as_type()
         && let Some(from_into_trait) = cx.tcx.get_diagnostic_item(match kind {
-            FunctionKind::TryFromFunction(_) => sym::From,
-            FunctionKind::TryIntoMethod | FunctionKind::TryIntoFunction(_) => sym::Into,
+            FunctionKind::TryFromFunction(_) | FunctionKind::FromStrFunction(_) => sym::From,
+            FunctionKind::TryIntoMethod | FunctionKind::TryIntoFunction(_) | FunctionKind::ParseMethod => sym::Into,
         })
         // If `T: TryFrom<U>` and `T: From<U>` both exist, then that means that the `TryFrom`
         // _must_ be from the blanket impl and cannot have been manually implemented
         // (else there would be conflicting impls, even with #![feature(spec)]), so we don't even need to check
         // what `<T as TryFrom<U>>::Error` is: it's always `Infallible`
+        //
+        // TODO: if we deal with the FromStr/.parse case, then there are no blanket impls,
+        // so we should filter to the cases where the replacement always works, or otherwise warn
         && implements_trait(cx, self_ty, from_into_trait, &[other_ty])
         && let Some(other_ty) = other_ty.as_type()
     {
@@ -124,8 +135,10 @@ fn check<'tcx>(
         };
 
         let (source_ty, target_ty) = match kind {
-            FunctionKind::TryIntoMethod | FunctionKind::TryIntoFunction(_) => (self_ty, other_ty),
-            FunctionKind::TryFromFunction(_) => (other_ty, self_ty),
+            FunctionKind::TryIntoMethod | FunctionKind::TryIntoFunction(_) | FunctionKind::ParseMethod => {
+                (self_ty, other_ty)
+            },
+            FunctionKind::TryFromFunction(_) | FunctionKind::FromStrFunction(_) => (other_ty, self_ty),
         };
 
         let (applicability, sugg) = kind.appl_sugg(parent_unwrap_call, primary_span);
@@ -147,21 +160,28 @@ fn check<'tcx>(
 
 /// Checks method call exprs:
 /// - `0i32.try_into()`
+/// - `"hi".parse()`
 pub(super) fn check_method(cx: &LateContext<'_>, expr: &Expr<'_>) {
-    if let ExprKind::MethodCall(path, ..) = expr.kind {
-        check(
-            cx,
-            expr,
-            cx.typeck_results().node_args(expr.hir_id),
-            FunctionKind::TryIntoMethod,
-            path.ident.span,
-        );
-    }
+    let ExprKind::MethodCall(path, ..) = expr.kind else {
+        return;
+    };
+    check(
+        cx,
+        expr,
+        cx.typeck_results().node_args(expr.hir_id),
+        match path.ident.name.as_str() {
+            "try_into" => FunctionKind::TryIntoMethod,
+            "parse" => FunctionKind::ParseMethod,
+            _ => return,
+        },
+        path.ident.span,
+    );
 }
 
 /// Checks function call exprs:
 /// - `<i64 as TryFrom<_>>::try_from(0i32)`
 /// - `<_ as TryInto<i64>>::try_into(0i32)`
+/// - `<_ as FromStr>::from_str("hi")`
 pub(super) fn check_function(cx: &LateContext<'_>, expr: &Expr<'_>, callee: &Expr<'_>) {
     if let ExprKind::Path(ref qpath) = callee.kind
         && let Some(item_def_id) = cx.qpath_res(qpath, callee.hir_id).opt_def_id()
@@ -191,6 +211,7 @@ pub(super) fn check_function(cx: &LateContext<'_>, expr: &Expr<'_>, callee: &Exp
             match cx.tcx.get_diagnostic_name(trait_def_id) {
                 Some(sym::TryFrom) => FunctionKind::TryFromFunction(qpath_spans),
                 Some(sym::TryInto) => FunctionKind::TryIntoFunction(qpath_spans),
+                Some(symbol) if symbol.as_str() == "FromStr" => FunctionKind::FromStrFunction(qpath_spans),
                 _ => return,
             },
             callee.span,
